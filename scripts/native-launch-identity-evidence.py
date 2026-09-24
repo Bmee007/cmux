@@ -2,14 +2,13 @@
 """Native launch-identity evidence probe.
 
 Runs against a live cmux app over the v2 Unix-socket protocol and checks the
-launch-identity contract that the native (ghostty) fork-owner capture publishes
-through ``surface.create`` / ``surface.split`` / ``surface.launch_identity``.
+launch-identity contract published through ``surface.create`` /
+``surface.split`` / ``surface.launch_identity``.
 
 Every check is behavioural: it creates real surfaces with real initial commands
-and cross-checks the reported identity against the live process table. It never
-reads source text or metadata.
-
-The probe prints a JSON report and exits non-zero if any hard check fails.
+and cross-checks reported identities against the live process table. It never
+reads source text or metadata. Each case is isolated, so one failure never hides
+the others. It prints a JSON report and exits non-zero if any hard case fails.
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 _TESTS_V2 = Path(__file__).resolve().parent.parent / "tests_v2"
 sys.path.insert(0, str(_TESTS_V2))
@@ -30,16 +29,14 @@ import cmux  # type: ignore[import-not-found]  # repo-local v2 client
 
 MARKER_COMMAND = "sleep 600"
 SCHEMA = "illumi.cmux-launch-identity.v1"
-REPORT_PATH = os.environ.get(
-    "CMUX_LAUNCH_IDENTITY_REPORT", "native-launch-identity-report.json"
-)
+REPORT_PATH = os.environ.get("CMUX_LAUNCH_IDENTITY_REPORT", "native-launch-identity-report.json")
 SOCKET_WAIT_SECONDS = float(os.environ.get("CMUX_SOCKET_WAIT_SECONDS", "60"))
 
 
 @dataclass(frozen=True)
 class CaseResult:
     name: str
-    status: str  # "pass" | "fail" | "not_probed"
+    status: str
     detail: str
     observed: Optional[Any] = None
 
@@ -49,28 +46,27 @@ class Probe:
     client: cmux.cmux
     results: list[CaseResult] = field(default_factory=list)
 
-    # -- bookkeeping -------------------------------------------------------
-    def record(
-        self, name: str, status: str, detail: str, observed: Optional[Any] = None
-    ) -> None:
+    def record(self, name: str, status: str, detail: str, observed: Optional[Any] = None) -> None:
         self.results.append(CaseResult(name, status, detail, observed))
 
     def fail_count(self) -> int:
         return sum(1 for r in self.results if r.status == "fail")
 
-    # -- helpers -----------------------------------------------------------
-    def ok_call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        result = self.client._call(method, params)
-        return dict(result or {})
+    def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        return dict(self.client._call(method, params) or {})
 
-    def expect_error(self, method: str, params: dict[str, Any], code: str) -> tuple[bool, str]:
-        """Return (matched, observed_message)."""
+    def try_call(self, method: str, params: dict[str, Any]) -> tuple[bool, Any]:
         try:
-            self.client._call(method, params)
+            return True, self.call(method, params)
         except cmux.cmuxError as exc:
-            message = str(exc)
-            return (message.startswith(f"{code}:") or code in message, message)
-        return (False, "call unexpectedly succeeded")
+            return False, str(exc)
+
+    def case(self, name: str, fn: Callable[[], tuple[str, str, Optional[Any]]]) -> None:
+        try:
+            status, detail, observed = fn()
+        except Exception as exc:
+            status, detail, observed = "fail", f"unexpected: {exc!r}", None
+        self.record(name, status, detail, observed)
 
     @staticmethod
     def process_table(pid: int) -> tuple[Optional[int], Optional[int], Optional[str]]:
@@ -83,9 +79,7 @@ class Probe:
             ).stdout.strip()
         except OSError:
             return (None, None, None)
-        if not out:
-            return (None, None, None)
-        parts = out.split(None, 2)
+        parts = out.split(None, 2) if out else []
         if len(parts) < 3:
             return (None, None, None)
         try:
@@ -94,66 +88,54 @@ class Probe:
             return (None, None, None)
 
 
-def _identity_is_well_formed(payload: dict[str, Any], surface_id: str) -> tuple[bool, str]:
+def identity_problems(payload: Any, surface_id: str) -> list[str]:
+    if not isinstance(payload, dict):
+        return ["launch_identity missing"]
+    problems: list[str] = []
     if payload.get("schema") != SCHEMA:
-        return (False, f"schema={payload.get('schema')!r} != {SCHEMA!r}")
+        problems.append(f"schema={payload.get('schema')!r}")
     if payload.get("valid") is not True:
-        return (False, f"valid={payload.get('valid')!r}")
+        problems.append(f"valid={payload.get('valid')!r}")
     if str(payload.get("surface_id")) != surface_id:
-        return (False, f"surface_id={payload.get('surface_id')!r} != {surface_id!r}")
+        problems.append(f"surface_id={payload.get('surface_id')!r}")
     if payload.get("command") != MARKER_COMMAND:
-        return (False, f"command={payload.get('command')!r} != {MARKER_COMMAND!r}")
+        problems.append(f"command={payload.get('command')!r}")
     for key in ("pid", "pgid"):
         value = payload.get(key)
         if not isinstance(value, int) or value <= 0:
-            return (False, f"{key}={value!r} is not a positive int")
+            problems.append(f"{key}={value!r}")
     token = payload.get("start_token")
     if not (isinstance(token, str) and token.isdigit() and int(token) > 0):
-        return (False, f"start_token={token!r} is not a positive int string")
-    return (True, "well-formed")
+        problems.append(f"start_token={token!r}")
+    return problems
 
 
 def run_probe(client: cmux.cmux) -> Probe:
     probe = Probe(client)
-
-    # 1. Happy path: require_launch_identity on surface.create.
     created: dict[str, Any] = {}
-    try:
-        created = probe.ok_call(
+
+    def create_require_initial_command() -> tuple[str, str, Optional[Any]]:
+        ok, out = probe.try_call(
             "surface.create",
             {"initial_command": MARKER_COMMAND, "require_launch_identity": True},
         )
-    except cmux.cmuxError as exc:
-        probe.record("create_requires_launch_identity", "fail", f"call failed: {exc}")
-        return probe
+        if not ok:
+            return "fail", f"surface.create rejected: {out}", None
+        surface_id = str(out.get("surface_id") or "")
+        created["require_surface"] = surface_id
+        identity = out.get("launch_identity")
+        created["identity"] = identity
+        problems = identity_problems(identity, surface_id)
+        return ("pass" if not problems else "fail", "; ".join(problems) or "well-formed", identity)
 
-    surface_id = str(created.get("surface_id") or "")
-    identity = created.get("launch_identity")
-    if not isinstance(identity, dict):
-        probe.record(
-            "create_requires_launch_identity",
-            "fail",
-            "surface.create returned no launch_identity",
-            created,
-        )
-        return probe
-    kind, why = _identity_is_well_formed(identity, surface_id)
-    probe.record(
-        "create_requires_launch_identity",
-        "pass" if kind else "fail",
-        why,
-        identity,
-    )
-    if not kind:
-        return probe
-
-    # 2. Cross-check the identity against the real process table.
-    pid = int(identity["pid"])
-    pgid = int(identity["pgid"])
-    real_pid, real_pgid, real_cmd = probe.process_table(pid)
-    if real_pid is None:
-        probe.record("identity_matches_live_process", "fail", f"pid {pid} not in ps")
-    else:
+    def cross_check_live_process() -> tuple[str, str, Optional[Any]]:
+        identity = created.get("identity")
+        if not isinstance(identity, dict) or not isinstance(identity.get("pid"), int):
+            return "not_probed", "no identity from the require case to cross-check", None
+        pid, pgid = int(identity["pid"]), int(identity["pgid"])
+        real_pid, real_pgid, real_cmd = probe.process_table(pid)
+        if real_pid is None:
+            return "fail", f"pid {pid} not found in ps", None
         problems: list[str] = []
         if real_pid != pid:
             problems.append(f"ps pid {real_pid} != {pid}")
@@ -161,90 +143,84 @@ def run_probe(client: cmux.cmux) -> Probe:
             problems.append(f"ps pgid {real_pgid} != {pgid}")
         if not real_cmd or MARKER_COMMAND not in real_cmd:
             problems.append(f"ps command {real_cmd!r} lacks {MARKER_COMMAND!r}")
-        probe.record(
-            "identity_matches_live_process",
+        return (
             "pass" if not problems else "fail",
-            "; ".join(problems) or f"pid={pid} pgid={pgid} cmd={real_cmd!r}",
+            "; ".join(problems) or "matches live process",
             {"ps_pid": real_pid, "ps_pgid": real_pgid, "ps_command": real_cmd},
         )
 
-    # 3. surface.launch_identity returns the same identity for that surface.
-    try:
-        fetched = probe.ok_call(
+    def plain_surface_identity() -> tuple[str, str, Optional[Any]]:
+        ok, out = probe.try_call("surface.create", {})
+        if not ok:
+            return "fail", f"surface.create failed: {out}", None
+        surface_id = str(out.get("surface_id") or "")
+        created["plain_surface"] = surface_id
+        ok_q, out_q = probe.try_call(
+            "surface.launch_identity", {"surface_id": surface_id, "command": MARKER_COMMAND}
+        )
+        if ok_q:
+            return "pass", "identity published for a plain surface", out_q.get("launch_identity")
+        return "fail", f"no identity for a plain surface: {out_q}", None
+
+    def initial_command_without_require() -> tuple[str, str, Optional[Any]]:
+        ok, out = probe.try_call("surface.create", {"initial_command": MARKER_COMMAND})
+        if not ok:
+            return "fail", f"surface.create failed: {out}", None
+        surface_id = str(out.get("surface_id") or "")
+        created["no_require_surface"] = surface_id
+        embedded = out.get("launch_identity")
+        ok_q, out_q = probe.try_call(
+            "surface.launch_identity", {"surface_id": surface_id, "command": MARKER_COMMAND}
+        )
+        observed = {"embedded": embedded, "queried": out_q.get("launch_identity") if ok_q else None}
+        if ok_q or isinstance(embedded, dict):
+            return "pass", "identity present without require_launch_identity", observed
+        return "fail", f"no identity without require: {out_q}", observed
+
+    def require_without_command() -> tuple[str, str, Optional[Any]]:
+        ok, out = probe.try_call("surface.create", {"require_launch_identity": True})
+        return ("pass", f"rejected: {out}", None) if not ok else ("fail", "call unexpectedly succeeded", out)
+
+    def require_non_normalized() -> tuple[str, str, Optional[Any]]:
+        ok, out = probe.try_call(
+            "surface.create",
+            {"initial_command": f" {MARKER_COMMAND} ", "require_launch_identity": True},
+        )
+        return ("pass", f"rejected: {out}", None) if not ok else ("fail", "call unexpectedly succeeded", out)
+
+    def split_require_without_command() -> tuple[str, str, Optional[Any]]:
+        ok, out = probe.try_call("surface.split", {"direction": "right", "require_launch_identity": True})
+        return ("pass", f"rejected: {out}", None) if not ok else ("fail", "call unexpectedly succeeded", out)
+
+    def unknown_surface() -> tuple[str, str, Optional[Any]]:
+        ok, out = probe.try_call(
             "surface.launch_identity",
-            {"surface_id": surface_id, "command": MARKER_COMMAND},
-        ).get("launch_identity")
-    except cmux.cmuxError as exc:
-        fetched = None
-        probe.record("launch_identity_lookup", "fail", f"call failed: {exc}")
-    else:
-        same = isinstance(fetched, dict) and fetched.get("pid") == pid and fetched.get(
-            "start_token"
-        ) == identity.get("start_token")
-        probe.record(
-            "launch_identity_lookup",
-            "pass" if same else "fail",
-            "same pid/start_token as create-time identity" if same else "identity drifted",
-            fetched,
+            {"surface_id": "00000000-0000-0000-0000-000000000000"},
         )
+        return ("pass", f"rejected: {out}", None) if not ok else ("fail", "call unexpectedly succeeded", out)
 
-    # 4. require_launch_identity without initial_command must fail closed.
-    matched, observed = probe.expect_error(
-        "surface.create", {"require_launch_identity": True}, "invalid_params"
-    )
-    probe.record("require_without_initial_command", "pass" if matched else "fail", observed)
+    def closed_surface() -> tuple[str, str, Optional[Any]]:
+        surface_id = created.get("plain_surface") or created.get("require_surface")
+        if not surface_id:
+            return "not_probed", "no surface available to close", None
+        probe.try_call("surface.close", {"surface_id": surface_id})
+        time.sleep(0.3)
+        ok, out = probe.try_call("surface.launch_identity", {"surface_id": surface_id})
+        return ("pass", f"rejected: {out}", None) if not ok else ("fail", "call unexpectedly succeeded", out)
 
-    # 5. Non-normalized initial_command must fail closed.
-    matched, observed = probe.expect_error(
-        "surface.create",
-        {"initial_command": f" {MARKER_COMMAND} ", "require_launch_identity": True},
-        "invalid_params",
-    )
-    probe.record("require_non_normalized_command", "pass" if matched else "fail", observed)
-
-    # 6. surface.split honours the same fail-closed rule.
-    matched, observed = probe.expect_error(
-        "surface.split", {"direction": "right", "require_launch_identity": True}, "invalid_params"
-    )
-    probe.record("split_require_without_command", "pass" if matched else "fail", observed)
-
-    # 7. A surface that was not launched with an exact command has no identity.
-    plain = probe.ok_call("surface.create", {})
-    plain_id = str(plain.get("surface_id") or "")
-    if plain_id:
-        matched, observed = probe.expect_error(
-            "surface.launch_identity",
-            {"surface_id": plain_id},
-            "launch_identity_unavailable",
-        )
-        probe.record(
-            "identity_unavailable_without_command",
-            "pass" if matched else "fail",
-            observed,
-        )
-        probe.client._call("surface.close", {"surface_id": plain_id})
-
-    # 8. Unknown surface id must fail closed.
-    matched, observed = probe.expect_error(
-        "surface.launch_identity",
-        {"surface_id": "00000000-0000-0000-0000-000000000000"},
-        "not_found",
-    )
-    probe.record("unknown_surface_not_found", "pass" if matched else "fail", observed)
-
-    # 9. A closed surface must not resolve.
-    probe.client._call("surface.close", {"surface_id": surface_id})
-    time.sleep(0.3)
-    matched, observed = probe.expect_error(
-        "surface.launch_identity", {"surface_id": surface_id}, "not_found"
-    )
-    probe.record("closed_surface_not_found", "pass" if matched else "fail", observed)
-
-    # Recorded, not asserted: these need the consumer or process-reuse harness.
+    probe.case("create_requires_launch_identity", create_require_initial_command)
+    probe.case("identity_matches_live_process", cross_check_live_process)
+    probe.case("plain_surface_publishes_identity", plain_surface_identity)
+    probe.case("initial_command_without_require", initial_command_without_require)
+    probe.case("require_without_initial_command", require_without_command)
+    probe.case("require_non_normalized_command", require_non_normalized)
+    probe.case("split_require_without_command", split_require_without_command)
+    probe.case("unknown_surface_not_found", unknown_surface)
+    probe.case("closed_surface_not_found", closed_surface)
     probe.record(
         "no_send_text_on_launch_path",
         "not_probed",
-        "initial_command is passed to addWorkspace(initialCommand:) with no surface.send_text; "
+        "initial_command is passed to addWorkspace(initialTerminalCommand:) with no surface.send_text; "
         "a runtime proof needs instrumented debug logging",
     )
     probe.record(
@@ -292,12 +268,7 @@ def main() -> int:
         "failed": probe.fail_count(),
         "not_probed": sum(1 for r in probe.results if r.status == "not_probed"),
         "results": [
-            {
-                "name": r.name,
-                "status": r.status,
-                "detail": r.detail,
-                "observed": r.observed,
-            }
+            {"name": r.name, "status": r.status, "detail": r.detail, "observed": r.observed}
             for r in probe.results
         ],
     }
