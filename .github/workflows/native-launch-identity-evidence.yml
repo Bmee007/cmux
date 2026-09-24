@@ -13,6 +13,11 @@ name: Native launch identity evidence
 
 on:
   workflow_dispatch:
+  push:
+    # Scoped to the evidence branch: workflow_dispatch needs the file on the
+    # default branch, but a push event runs the workflow from the pushed commit.
+    branches:
+      - illumi/dual-runtime-v7-local-cmux-native-api
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
