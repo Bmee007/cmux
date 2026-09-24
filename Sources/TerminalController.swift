@@ -3429,6 +3429,8 @@ class TerminalController {
             return v2Result(id: id, self.v2SurfaceSplit(params: params))
         case "surface.create":
             return v2Result(id: id, self.v2SurfaceCreate(params: params))
+        case "surface.launch_identity":
+            return v2Result(id: id, self.v2SurfaceLaunchIdentity(params: params))
         case "surface.close":
             return v2Result(id: id, self.v2SurfaceClose(params: params))
         case "surface.move":
@@ -5463,6 +5465,7 @@ class TerminalController {
 
         let requestedInitialCommand = v2RawString(params, "initial_command")?.trimmingCharacters(in: .whitespacesAndNewlines)
         let initialCommand = (requestedInitialCommand?.isEmpty == false) ? requestedInitialCommand : nil
+        let requireLaunchIdentity = v2SurfaceLaunchIdentityRequired(params)
 
         let rawInitialEnv = v2StringMap(params, "initial_env") ?? [:]
         let initialEnv = rawInitialEnv.reduce(into: [String: String]()) { result, pair in
@@ -5501,8 +5504,20 @@ class TerminalController {
             }
         }
 
+        if requireLaunchIdentity && initialCommand == nil {
+            return .err(code: "invalid_params", message: "require_launch_identity requires a non-empty initial_command", data: nil)
+        }
+        if requireLaunchIdentity && v2RawString(params, "initial_command") != initialCommand {
+            return .err(code: "invalid_params", message: "require_launch_identity requires an already-normalized exact initial_command", data: nil)
+        }
+        if requireLaunchIdentity && layoutNode != nil {
+            return .err(code: "invalid_params", message: "require_launch_identity is not supported with layout-based workspace creation", data: nil)
+        }
+
         var newId: UUID?
         var initialSurfaceId: UUID?
+        var initialLaunchIdentity: [String: Any]?
+        var launchIdentityError: V2CallResult?
         let shouldFocus = v2FocusAllowed(requested: v2Bool(params, "focus") ?? false)
         v2MainSync {
             let ws = tabManager.addWorkspace(
@@ -5519,20 +5534,39 @@ class TerminalController {
             }
             newId = ws.id
             initialSurfaceId = ws.focusedPanelId
+            if let initialSurfaceId {
+                initialLaunchIdentity = v2AwaitSurfaceLaunchIdentityPayload(
+                    terminalPanel: ws.terminalPanel(for: initialSurfaceId),
+                    surfaceId: initialSurfaceId,
+                    command: initialCommand
+                )
+                if requireLaunchIdentity && initialLaunchIdentity == nil {
+                    _ = ws.closePanel(initialSurfaceId, force: true)
+                    launchIdentityError = .err(code: "launch_identity_unavailable", message: "CMUX surface launch identity was not atomically published", data: ["surface_id": initialSurfaceId.uuidString])
+                }
+            }
+        }
+
+        if let launchIdentityError {
+            return launchIdentityError
         }
 
         guard let newId else {
             return .err(code: "internal_error", message: "Failed to create workspace", data: nil)
         }
         let windowId = v2ResolveWindowId(tabManager: tabManager)
-        return .ok([
+        var payload: [String: Any] = [
             "window_id": v2OrNull(windowId?.uuidString),
             "window_ref": v2Ref(kind: .window, uuid: windowId),
             "workspace_id": newId.uuidString,
             "workspace_ref": v2Ref(kind: .workspace, uuid: newId),
             "surface_id": v2OrNull(initialSurfaceId?.uuidString),
             "surface_ref": v2Ref(kind: .surface, uuid: initialSurfaceId)
-        ])
+        ]
+        if let initialLaunchIdentity {
+            payload["launch_identity"] = initialLaunchIdentity
+        }
+        return .ok(payload)
     }
     private func v2WorkspaceSelect(params: [String: Any]) -> V2CallResult {
         guard let tabManager = v2ResolveTabManager(params: params) else {
@@ -8291,6 +8325,81 @@ class TerminalController {
         ]
     }
 
+    private func v2SurfaceLaunchIdentityRequired(_ params: [String: Any]) -> Bool {
+        v2Bool(params, "require_launch_identity") ?? v2Bool(params, "requireLaunchIdentity") ?? false
+    }
+
+    @MainActor
+    private func v2SurfaceLaunchIdentityPayload(
+        terminalPanel: TerminalPanel?,
+        surfaceId: UUID,
+        command: String?
+    ) -> [String: Any]? {
+        guard let terminalPanel,
+              let command,
+              let identity = terminalPanel.surface.launchIdentity(),
+              let pid = Int(exactly: identity.pid),
+              let pgid = Int(exactly: identity.pgid) else {
+            return nil
+        }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        return [
+            "schema": "illumi.cmux-launch-identity.v1",
+            "valid": true,
+            "surface_id": surfaceId.uuidString,
+            "command": command,
+            "pid": pid,
+            "pgid": pgid,
+            "start_token": String(identity.startToken),
+            "issued_at": formatter.string(from: Date())
+        ]
+    }
+
+    @MainActor
+    private func v2AwaitSurfaceLaunchIdentityPayload(
+        terminalPanel: TerminalPanel?,
+        surfaceId: UUID,
+        command: String?,
+        timeout: TimeInterval = 3.0,
+        interval: TimeInterval = 0.05
+    ) -> [String: Any]? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            if let payload = v2SurfaceLaunchIdentityPayload(terminalPanel: terminalPanel, surfaceId: surfaceId, command: command) {
+                return payload
+            }
+            if Date() >= deadline { return nil }
+            Thread.sleep(forTimeInterval: interval)
+        }
+    }
+
+    private func v2SurfaceLaunchIdentity(params: [String: Any]) -> V2CallResult {
+        guard let tabManager = v2ResolveTabManager(params: params) else {
+            return .err(code: "unavailable", message: "TabManager not available", data: nil)
+        }
+        guard let surfaceId = v2UUID(params, "surface_id") else {
+            return .err(code: "invalid_params", message: "Missing or invalid surface_id", data: nil)
+        }
+        let command = v2OptionalTrimmedRawString(params, "command")
+        var result: V2CallResult = .err(code: "launch_identity_unavailable", message: "CMUX surface launch identity is not currently valid", data: ["surface_id": surfaceId.uuidString])
+        v2MainSync {
+            guard let ws = v2ResolveWorkspace(params: params, tabManager: tabManager),
+                  let terminalPanel = ws.terminalPanel(for: surfaceId) else {
+                result = .err(code: "not_found", message: "Surface not found", data: ["surface_id": surfaceId.uuidString])
+                return
+            }
+            guard let launchIdentity = v2SurfaceLaunchIdentityPayload(
+                terminalPanel: terminalPanel,
+                surfaceId: surfaceId,
+                command: command
+            ) else { return }
+            result = .ok(["launch_identity": launchIdentity])
+        }
+        return result
+    }
+
     private func v2SurfaceFocus(params: [String: Any]) -> V2CallResult {
         guard let tabManager = v2ResolveTabManager(params: params) else {
             return .err(code: "unavailable", message: "TabManager not available", data: nil)
@@ -8336,6 +8445,7 @@ class TerminalController {
             return .err(code: "invalid_params", message: "Missing or invalid direction (left|right|up|down)", data: nil)
         }
         let panelType = v2PanelType(params, "type") ?? .terminal
+        let requireLaunchIdentity = v2SurfaceLaunchIdentityRequired(params)
         let urlStr = v2String(params, "url")
         let url = urlStr.flatMap { URL(string: $0) }
         let workingDirectory = v2OptionalTrimmedRawString(params, "working_directory")
@@ -8348,6 +8458,15 @@ class TerminalController {
             return error
         }
         let initialDividerPosition = parsedInitialDivider.value
+        if requireLaunchIdentity && panelType != .terminal {
+            return .err(code: "invalid_params", message: "require_launch_identity is only valid for terminal surfaces", data: nil)
+        }
+        if requireLaunchIdentity && initialCommand == nil {
+            return .err(code: "invalid_params", message: "require_launch_identity requires a non-empty initial_command", data: nil)
+        }
+        if requireLaunchIdentity && v2RawString(params, "initial_command") != initialCommand {
+            return .err(code: "invalid_params", message: "require_launch_identity requires an already-normalized exact initial_command", data: nil)
+        }
         if panelType == .browser, BrowserAvailabilitySettings.isDisabled() {
             return v2BrowserDisabledExternalOpenResult(rawURL: urlStr, url: url, tabManager: tabManager)
         }
@@ -8409,7 +8528,7 @@ class TerminalController {
             if let newId {
                 let paneUUID = ws.paneId(forPanelId: newId)?.id
                 let windowId = v2ResolveWindowId(tabManager: tabManager)
-                result = .ok([
+                var payload: [String: Any] = [
                     "window_id": v2OrNull(windowId?.uuidString),
                     "window_ref": v2Ref(kind: .window, uuid: windowId),
                     "workspace_id": ws.id.uuidString,
@@ -8419,7 +8538,19 @@ class TerminalController {
                     "surface_id": newId.uuidString,
                     "surface_ref": v2Ref(kind: .surface, uuid: newId),
                     "type": v2OrNull(ws.panels[newId]?.panelType.rawValue)
-                ])
+                ]
+                if let launchIdentity = v2AwaitSurfaceLaunchIdentityPayload(
+                    terminalPanel: ws.terminalPanel(for: newId),
+                    surfaceId: newId,
+                    command: initialCommand
+                ) {
+                    payload["launch_identity"] = launchIdentity
+                } else if requireLaunchIdentity {
+                    _ = ws.closePanel(newId, force: true)
+                    result = .err(code: "launch_identity_unavailable", message: "CMUX surface launch identity was not atomically published", data: ["surface_id": newId.uuidString])
+                    return
+                }
+                result = .ok(payload)
             } else {
                 result = .err(code: "internal_error", message: "Failed to create split", data: nil)
             }
@@ -8432,6 +8563,7 @@ class TerminalController {
         }
 
         let panelType = v2PanelType(params, "type") ?? .terminal
+        let requireLaunchIdentity = v2SurfaceLaunchIdentityRequired(params)
         let urlStr = v2String(params, "url")
         let url = urlStr.flatMap { URL(string: $0) }
         let workingDirectory = v2OptionalTrimmedRawString(params, "working_directory")
@@ -8439,6 +8571,15 @@ class TerminalController {
         let tmuxStartCommand = v2OptionalTrimmedRawString(params, "tmux_start_command")
         let remotePTYSessionID = v2OptionalTrimmedRawString(params, "remote_pty_session_id")
         let startupEnvironment = v2TrimmedStringMap(params, keys: ["startup_environment", "initial_env"])
+        if requireLaunchIdentity && panelType != .terminal {
+            return .err(code: "invalid_params", message: "require_launch_identity is only valid for terminal surfaces", data: nil)
+        }
+        if requireLaunchIdentity && initialCommand == nil {
+            return .err(code: "invalid_params", message: "require_launch_identity requires a non-empty initial_command", data: nil)
+        }
+        if requireLaunchIdentity && v2RawString(params, "initial_command") != initialCommand {
+            return .err(code: "invalid_params", message: "require_launch_identity requires an already-normalized exact initial_command", data: nil)
+        }
         if panelType == .browser, BrowserAvailabilitySettings.isDisabled() {
             return v2BrowserDisabledExternalOpenResult(rawURL: urlStr, url: url, tabManager: tabManager)
         }
@@ -8492,7 +8633,7 @@ class TerminalController {
             }
 
             let windowId = v2ResolveWindowId(tabManager: tabManager)
-            result = .ok([
+            var payload: [String: Any] = [
                 "window_id": v2OrNull(windowId?.uuidString),
                 "window_ref": v2Ref(kind: .window, uuid: windowId),
                 "workspace_id": ws.id.uuidString,
@@ -8502,7 +8643,19 @@ class TerminalController {
                 "surface_id": newPanelId.uuidString,
                 "surface_ref": v2Ref(kind: .surface, uuid: newPanelId),
                 "type": panelType.rawValue
-            ])
+            ]
+            if let launchIdentity = v2AwaitSurfaceLaunchIdentityPayload(
+                terminalPanel: ws.terminalPanel(for: newPanelId),
+                surfaceId: newPanelId,
+                command: initialCommand
+            ) {
+                payload["launch_identity"] = launchIdentity
+            } else if requireLaunchIdentity {
+                _ = ws.closePanel(newPanelId, force: true)
+                result = .err(code: "launch_identity_unavailable", message: "CMUX surface launch identity was not atomically published", data: ["surface_id": newPanelId.uuidString])
+                return
+            }
+            result = .ok(payload)
         }
         return result
     }

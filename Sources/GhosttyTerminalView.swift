@@ -21,6 +21,12 @@ private func ghostty_surface_clear_selection_compat(_ surface: ghostty_surface_t
 @_silgen_name("ghostty_surface_select_cursor_cell")
 private func ghostty_surface_select_cursor_cell_compat(_ surface: ghostty_surface_t) -> Bool
 
+struct TerminalSurfaceLaunchIdentity: Equatable {
+    let pid: UInt64
+    let pgid: UInt64
+    let startToken: UInt64
+}
+
 enum GhosttyStartupAppearancePreviewProfile: String, CaseIterable, Identifiable {
     case realUserConfig
     case freshInstall
@@ -5712,6 +5718,20 @@ final class TerminalSurface: Identifiable, ObservableObject {
         withDebugMetadataLock {
             runtimeSurfaceCreatedAt = Date()
         }
+    }
+
+    @MainActor
+    func launchIdentity() -> TerminalSurfaceLaunchIdentity? {
+        guard let surface = liveSurfaceForGhosttyAccess(reason: "launchIdentity") else { return nil }
+        let identity = ghostty_surface_launch_identity(surface)
+        guard identity.valid, identity.pid > 0, identity.pgid > 0, identity.start_token > 0 else {
+            return nil
+        }
+        return TerminalSurfaceLaunchIdentity(
+            pid: identity.pid,
+            pgid: identity.pgid,
+            startToken: identity.start_token
+        )
     }
 
     private func allowsRuntimeSurfaceCreation() -> Bool {
