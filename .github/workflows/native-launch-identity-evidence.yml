@@ -30,6 +30,7 @@ jobs:
     env:
       GHOSTTYKIT_CRASH_REPORT_SUBDIR: cmux/crash
       CMUX_TAG: native-identity-ci
+      CMUX_SOCKET_MODE: automation
       CMUX_LAUNCH_IDENTITY_REPORT: ${{ github.workspace }}/native-launch-identity-report.json
     steps:
       - name: Checkout
