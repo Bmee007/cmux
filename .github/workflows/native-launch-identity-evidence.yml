@@ -29,7 +29,6 @@ jobs:
     timeout-minutes: 90
     env:
       GHOSTTYKIT_CRASH_REPORT_SUBDIR: cmux/crash
-      CMUX_SOCKET_PATH: /tmp/cmux-debug.sock
       CMUX_LAUNCH_IDENTITY_REPORT: ${{ github.workspace }}/native-launch-identity-report.json
     steps:
       - name: Checkout
@@ -91,15 +90,39 @@ jobs:
           fi
           echo "Launching: $APP"
           open "$APP"
-          for _ in $(seq 1 90); do
-            if [[ -S "$CMUX_SOCKET_PATH" ]]; then break; fi
-            if [[ -S /tmp/cmux-debug.sock ]]; then break; fi
+
+          socket=""
+          for _ in $(seq 1 120); do
+            for candidate in \
+              "$(cat "$HOME/Library/Application Support/cmux/last-socket-path" 2>/dev/null || true)" \
+              "$(cat /tmp/cmux-last-socket-path 2>/dev/null || true)" \
+              /tmp/cmux-debug.sock \
+              "$HOME/Library/Application Support/cmux/cmux.sock" \
+              /tmp/cmux.sock
+            do
+              if [[ -n "$candidate" && -S "$candidate" ]]; then
+                socket="$candidate"
+                break 2
+              fi
+            done
             sleep 1
           done
-          ls -la /tmp/cmux*.sock 2>/dev/null || true
+
+          echo "== diagnostics =="
+          pgrep -fl "cmux" || true
+          ls -la /tmp/cmux*.sock 2>/dev/null || echo "(no /tmp sockets)"
+          if [[ -z "$socket" ]]; then
+            echo "No cmux socket appeared; recent app log:" >&2
+            log show --last 3m --predicate 'process == "cmux"' --style compact 2>/dev/null | tail -60 || true
+            exit 1
+          fi
+          echo "CMUX_SOCKET_PATH=$socket" >> "$GITHUB_ENV"
+          echo "Using socket: $socket"
 
       - name: Run the launch-identity probe
-        run: python3 scripts/native-launch-identity-evidence.py | tee probe-output.txt
+        run: |
+          set -euo pipefail
+          python3 scripts/native-launch-identity-evidence.py | tee probe-output.txt
 
       - name: Upload evidence
         if: always()
