@@ -89,7 +89,15 @@ jobs:
             exit 1
           fi
           echo "Launching: $APP"
-          open "$APP"
+          open "$APP" || true
+          sleep 5
+
+          if ! pgrep -f "cmux" >/dev/null; then
+            echo "open left no cmux process; launching the bundle binary directly for stderr:"
+            EXEC="$(defaults read "$APP/Contents/Info" CFBundleExecutable)"
+            "$APP/Contents/MacOS/$EXEC" > /tmp/cmux-app.log 2>&1 &
+            sleep 10
+          fi
 
           socket=""
           for _ in $(seq 1 120); do
@@ -109,11 +117,15 @@ jobs:
           done
 
           echo "== diagnostics =="
-          pgrep -fl "cmux" || true
+          pgrep -fl "cmux" || echo "(no cmux process)"
           ls -la /tmp/cmux*.sock 2>/dev/null || echo "(no /tmp sockets)"
+          echo "== direct-launch stderr =="
+          tail -80 /tmp/cmux-app.log 2>/dev/null || echo "(no direct-launch log)"
           if [[ -z "$socket" ]]; then
-            echo "No cmux socket appeared; recent app log:" >&2
-            log show --last 3m --predicate 'process == "cmux"' --style compact 2>/dev/null | tail -60 || true
+            echo "== crash reports =="
+            for f in "$HOME"/Library/Logs/DiagnosticReports/cmux*; do
+              [[ -f "$f" ]] && echo "--- $f" && tail -50 "$f"
+            done
             exit 1
           fi
           echo "CMUX_SOCKET_PATH=$socket" >> "$GITHUB_ENV"
