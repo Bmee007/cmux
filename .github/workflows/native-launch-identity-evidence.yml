@@ -29,6 +29,7 @@ jobs:
     timeout-minutes: 90
     env:
       GHOSTTYKIT_CRASH_REPORT_SUBDIR: cmux/crash
+      CMUX_TAG: native-identity-ci
       CMUX_LAUNCH_IDENTITY_REPORT: ${{ github.workspace }}/native-launch-identity-report.json
     steps:
       - name: Checkout
@@ -88,20 +89,15 @@ jobs:
             ls -la "$PRODUCT_DIR" >&2 || true
             exit 1
           fi
-          echo "Launching: $APP"
-          open "$APP" || true
+          echo "Launching: $APP (CMUX_TAG=$CMUX_TAG)"
+          EXEC="$(defaults read "$APP/Contents/Info" CFBundleExecutable)"
+          "$APP/Contents/MacOS/$EXEC" > /tmp/cmux-app.log 2>&1 &
           sleep 5
-
-          if ! pgrep -f "cmux" >/dev/null; then
-            echo "open left no cmux process; launching the bundle binary directly for stderr:"
-            EXEC="$(defaults read "$APP/Contents/Info" CFBundleExecutable)"
-            "$APP/Contents/MacOS/$EXEC" > /tmp/cmux-app.log 2>&1 &
-            sleep 10
-          fi
 
           socket=""
           for _ in $(seq 1 120); do
             for candidate in \
+              "/tmp/cmux-debug-${CMUX_TAG}.sock" \
               "$(cat "$HOME/Library/Application Support/cmux/last-socket-path" 2>/dev/null || true)" \
               "$(cat /tmp/cmux-last-socket-path 2>/dev/null || true)" \
               /tmp/cmux-debug.sock \
@@ -119,8 +115,8 @@ jobs:
           echo "== diagnostics =="
           pgrep -fl "cmux" || echo "(no cmux process)"
           ls -la /tmp/cmux*.sock 2>/dev/null || echo "(no /tmp sockets)"
-          echo "== direct-launch stderr =="
-          tail -80 /tmp/cmux-app.log 2>/dev/null || echo "(no direct-launch log)"
+          echo "== app stderr =="
+          tail -80 /tmp/cmux-app.log 2>/dev/null || echo "(no app log)"
           if [[ -z "$socket" ]]; then
             echo "== crash reports =="
             for f in "$HOME"/Library/Logs/DiagnosticReports/cmux*; do
