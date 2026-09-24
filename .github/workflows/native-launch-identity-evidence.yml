@@ -1,0 +1,98 @@
+name: Native launch identity evidence
+
+# Self-contained evidence lane for the CMUX/Ghostty launch-identity work.
+#
+# It builds GhosttyKit.xcframework from the *patched* ghostty submodule with a
+# full Xcode + Metal toolchain (which a plain CLT host cannot), links the cmux
+# Debug app against the new C ABI, launches it, and runs the behavioural probe
+# in scripts/native-launch-identity-evidence.py.
+#
+# Deliberately separate from ci.yml: the stock macOS jobs download a prebuilt
+# GhosttyKit keyed to the submodule SHA, which does not exist for a patched
+# (unpublished) SHA. This lane builds it locally instead.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  evidence:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      GHOSTTYKIT_CRASH_REPORT_SUBDIR: cmux/crash
+      CMUX_SOCKET_PATH: /tmp/cmux-debug.sock
+      CMUX_LAUNCH_IDENTITY_REPORT: ${{ github.workspace }}/native-launch-identity-report.json
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          if [[ ! -d /Applications/Xcode.app/Contents/Developer ]]; then
+            echo "No full Xcode found" >&2
+            exit 1
+          fi
+          echo "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer" >> "$GITHUB_ENV"
+          export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+          xcrun --sdk macosx --find metal
+
+      - name: Record submodule SHA under test
+        run: git -C ghostty rev-parse HEAD | tee ghostty-sha.txt
+
+      - name: Install zig
+        run: ./scripts/install-zig-ci.sh
+
+      - name: Build GhosttyKit.xcframework from the patched ghostty
+        run: ./scripts/ensure-ghosttykit.sh
+
+      - name: Build the cmux Debug app against the new C ABI
+        run: |
+          set -euo pipefail
+          xcodebuild -project cmux.xcodeproj -scheme cmux -configuration Debug \
+            -destination 'platform=macOS' \
+            -derivedDataPath /tmp/cmux-native-identity \
+            build
+
+      - name: Launch the Debug app
+        run: |
+          set -euo pipefail
+          PRODUCT_DIR=/tmp/cmux-native-identity/Build/Products/Debug
+          APP="$(find "$PRODUCT_DIR" -maxdepth 1 -name 'cmux*.app' -print -quit)"
+          if [[ -z "$APP" ]]; then
+            APP="$(find "$PRODUCT_DIR" -maxdepth 1 -name '*.app' -print -quit)"
+          fi
+          if [[ -z "$APP" ]]; then
+            echo "No .app produced under $PRODUCT_DIR" >&2
+            ls -la "$PRODUCT_DIR" >&2 || true
+            exit 1
+          fi
+          echo "Launching: $APP"
+          open "$APP"
+          for _ in $(seq 1 90); do
+            if [[ -S "$CMUX_SOCKET_PATH" ]]; then break; fi
+            if [[ -S /tmp/cmux-debug.sock ]]; then break; fi
+            sleep 1
+          done
+          ls -la /tmp/cmux*.sock 2>/dev/null || true
+
+      - name: Run the launch-identity probe
+        run: python3 scripts/native-launch-identity-evidence.py | tee probe-output.txt
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-launch-identity-evidence
+          path: |
+            native-launch-identity-report.json
+            probe-output.txt
+            ghostty-sha.txt
+          if-no-files-found: warn
