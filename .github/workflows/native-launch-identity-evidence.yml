@@ -18,6 +18,7 @@ on:
     # default branch, but a push event runs the workflow from the pushed commit.
     branches:
       - illumi/dual-runtime-v7-local-cmux-native-api
+      - illumi/launch-identity-fix
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
